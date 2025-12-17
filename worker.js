@@ -499,6 +499,8 @@ async function handleEvent(event, env, ctx, requestUrl) {
       // Save Data (Requirement: D1/1D must be stored as 1D only)
       await saveAnalysis(userId, detectedTF, Date.now(), readableTime, toStore, env);
 
+      await markJobDone(jobId, env, detectedTF);
+
       await replyText(replyToken, analysisResult.user_response_text || "✅ บันทึกผลวิเคราะห์เรียบร้อยแล้วครับ", env, mainMenu);
     
       // If there are more jobs queued (user sent multiple images), continue background processing
@@ -510,6 +512,7 @@ async function handleEvent(event, env, ctx, requestUrl) {
 
   } catch (error) {
     console.error(safeError(error));
+    try { await markJobError(jobId, env, error.message); } catch (_) {}
     await replyText(replyToken, `⚠️ System Error:
 ${error.message}`, env, mainMenu);
   }
