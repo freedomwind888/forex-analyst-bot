@@ -409,110 +409,17 @@ async function handleEvent(event, env, ctx, requestUrl) {
       // Enqueue this image for FIFO processing (allows users to send multiple images continuously)
       const { jobId, createdAt } = await enqueueAnalysisJob(userId, messageId, env);
 
-      // If there is already a queue/processing job, acknowledge immediately and let background worker process in order
-      const qStats = await getUserQueueStats(userId, env);
-      const canFastPath = (qStats.processing_count === 0 && qStats.queued_count === 1);
+      const ackMsg = await buildQueueAckMessage(userId, jobId, createdAt, env);
 
-      if (!canFastPath) {
-        const ackMsg = await buildQueueAckMessage(userId, jobId, createdAt, env);
+      await replyText(replyToken, ackMsg, env, mainMenu);
 
-        await replyText(replyToken, ackMsg, env, mainMenu);
+      await triggerInternalAnalyze(userId, requestUrl, env);
 
-        await triggerInternalAnalyze(userId, requestUrl, env);
-        return;
-      }
-
-      // This is the only job in queue -> try FAST-PATH (use replyToken) while also marking job as processing
-      await env.DB.prepare(`UPDATE analysis_jobs SET status='processing', started_at=? WHERE job_id=? AND status='queued'`)
-        .bind(Date.now(), jobId).run();
-      const { arrayBuffer: imageBinary, contentType } = await getContentFromLine(messageId, env);
-      const base64Image = arrayBufferToBase64(imageBinary);
-
-      // Load ALL previous analyses
-      const existingRows = await getAllAnalyses(userId, env);
-
-      // FAST-PATH: try to finish analysis within a short deadline (use replyToken as usual)
-      const FAST_DEADLINE_MS = Number(env.FAST_ANALYSIS_DEADLINE_MS || 18000);
-      const controller = new AbortController();
-
-      let analysisResult = null;
-      try {
-        analysisResult = await promiseWithTimeout(
-          analyzeChartStructured(userId, base64Image, existingRows, env, { mimeType: contentType, signal: controller.signal }),
-          FAST_DEADLINE_MS
-        );
-      } catch (e) {
-        // If we're running out of time, ACK first, then continue in background via internal endpoint
-        controller.abort();
-
-        // Re-queue current job so the internal FIFO processor can continue
-        try { await requeueJob(jobId, env, 1, 'Foreground timeout -> background'); } catch (_) {}
-        const ackMsg = await buildQueueAckMessage(userId, jobId, createdAt, env);
-
-        await replyText(replyToken, ackMsg, env, mainMenu);
-
-        // Free-plan friendly background continuation: self-invocation internal endpoint
-        await triggerInternalAnalyze(userId, requestUrl, env);
-        return;
-      }
-
-      // Handle "Stale Data" Request
-      if (analysisResult?.request_update_for_tf && analysisResult.request_update_for_tf.length > 0) {
-        const tfList = Array.isArray(analysisResult.request_update_for_tf)
-          ? analysisResult.request_update_for_tf.join(', ')
-          : analysisResult.request_update_for_tf;
-        const warningMsg = `⚠️ **ข้อมูลไม่เพียงพอสำหรับ Top-Down Analysis**
-
-ระบบต้องการภาพ TF: **${tfList}** เพิ่มเติมเพื่อยืนยันแนวโน้มหลัก (Big Picture)
-
-📸 กรุณาส่งภาพกราฟ **${tfList}** เข้ามาครับ`;
-        await replyText(replyToken, warningMsg, env, mainMenu);
-        return;
-      // Close job to avoid blocking the queue
-      try { await markJobDone(jobId, env, 'REQUEST_UPDATE'); } catch (_) {}
-
-      }
-
-      const detectedTF = normalizeTF(analysisResult?.detected_tf || "Unknown_TF");
-      const now = new Date();
-      const readableTime = now.toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' });
-
-      // Build rich analysis JSON for DB (Requirement: store detailed info, not only setup)
-      const detailed = analysisResult?.detailed_technical_data || {};
-      const toStore = {
-        detected_tf: detectedTF,
-        tfs_used_for_confluence: analysisResult?.tfs_used_for_confluence || [],
-        request_update_for_tf: analysisResult?.request_update_for_tf || null,
-        trend_bias: detailed.trend_bias || detailed?.structure?.trend_bias || 'Unknown',
-        trade_setup: detailed.trade_setup || detailed?.setup || {},
-        reasoning_trace: analysisResult?.reasoning_trace || detailed?.reasoning_trace || [],
-        structure: detailed.structure || detailed?.priority_1_structure || {},
-        value: detailed.value || detailed?.priority_2_value || {},
-        trigger: detailed.trigger || detailed?.priority_3_trigger || {},
-        indicators: detailed.indicators || {},
-        patterns: detailed.patterns || [],
-        key_levels: detailed.key_levels || {},
-        raw_extraction: detailed.raw_extraction || {},
-        notes: detailed.notes || null
-      };
-
-      // Save Data (Requirement: D1/1D must be stored as 1D only)
-      await saveAnalysis(userId, detectedTF, Date.now(), readableTime, toStore, env);
-
-      await markJobDone(jobId, env, detectedTF);
-
-      await replyText(replyToken, analysisResult.user_response_text || "✅ บันทึกผลวิเคราะห์เรียบร้อยแล้วครับ", env, mainMenu);
-    
-      // If there are more jobs queued (user sent multiple images), continue background processing
-      try {
-        const st = await getUserQueueStats(userId, env);
-        if (st.queued_count > 0) await triggerInternalAnalyze(userId, requestUrl, env);
-      } catch (_) {}
-}
+      return;
+    }
 
   } catch (error) {
     console.error(safeError(error));
-    try { await markJobError(jobId, env, error.message); } catch (_) {}
     await replyText(replyToken, `⚠️ System Error:
 ${error.message}`, env, mainMenu);
   }
